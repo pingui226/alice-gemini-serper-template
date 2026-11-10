@@ -1,10 +1,12 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "qwen/qwen3.5-9b"; // Автовыбор модели в OpenRouter или укажите конкретную, например "meta-llama/llama-3-8b-instruct"
+const DEFAULT_BASE_URL = "https://polza.ai/api/v1"; // Базовый URL по умолчанию
+
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const LLM_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -51,6 +53,7 @@ function isSearchIntent(text) {
 
 function safeHistory(history) {
   if (!Array.isArray(history)) return [];
+  // Сохраняем логику Алисы (модель/пользователь), чтобы не сломать стейт, но отфильтруем лишнее
   return history
     .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
@@ -110,78 +113,79 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+async function askLLM(text, history, searchContext, timeoutMs) {
+  const key = process.env.LLM_API_KEY;
+  if (!key) throw new Error("MISSING_LLM_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  const model = String(process.env.LLM_MODEL || DEFAULT_MODEL).trim();
+  const baseUrl = String(process.env.LLM_BASE_URL || DEFAULT_BASE_URL).trim();
 
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
-  }));
+  // Формируем сообщения в стандарте OpenAI
+  const messages = [{ role: "system", content: SYSTEM_PROMPT }];
+
+  safeHistory(history).forEach(item => {
+    // В Алисе роль нейросети называется "model", а в OpenAI API — "assistant"
+    const role = item.role === "model" ? "assistant" : "user";
+    messages.push({ role, content: item.text });
+  });
 
   const prompt = searchContext
     ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  
+  messages.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    `${baseUrl}/chat/completions`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "Authorization": `Bearer ${key}`,
+        // Опциональные заголовки для OpenRouter (для статистики и отображения на сайте)
+        "HTTP-Referer": process.env.SITE_URL || "https://github.com/",
+        "X-Title": process.env.SITE_NAME || "Alice Yandex Skill"
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
+        model,
+        messages,
+        temperature: 0.5,
+        max_tokens: 240
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(LLM_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
     const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error("LLM API request failed with HTTP", status, data);
+    if (status === 401 || status === 403) throw new Error("LLM_KEY_REJECTED");
+    if (status === 429 || status === 402) throw new Error("LLM_QUOTA");
+    throw new Error("LLM_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
+  // Извлекаем ответ в стандарте OpenAI
+  const answer = data?.choices?.[0]?.message?.content?.trim();
 
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
+    throw new Error("LLM_EMPTY_RESPONSE");
   }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
+  if (data?.choices?.[0]?.finish_reason === "length") {
+    console.warn("LLM reached the output token limit.");
   }
+  
   return answer;
 }
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
-      return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
+    case "MISSING_LLM_KEY":
+      return "Сервер пока не настроен. Проверьте переменную LLM API KEY в настройках.";
+    case "LLM_KEY_REJECTED":
+      return "Не удалось подключиться к нейросети. Проверьте API-ключ.";
+    case "LLM_QUOTA":
+      return "Сейчас превышен лимит запросов или закончился баланс. Попробуйте немного позже.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
       return "Не успела подготовить ответ. Попробуйте задать вопрос ещё раз, чуть короче.";
@@ -194,7 +198,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-llm-serper",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -221,21 +225,20 @@ export default async function handler(req, res) {
   try {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askLLM(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
     );
 
     const history = [
       ...oldHistory,
       { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) } // Оставляем 'model' для стейта Алисы
     ].slice(-MAX_HISTORY_MESSAGES);
 
     return res.status(200).json(aliceResponse(answer, false, history));
